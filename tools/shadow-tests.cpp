@@ -12,6 +12,7 @@ using Microsoft::WRL::ComPtr;
 struct ShadowTestAccess
 {
     static ID3D12Resource* Map(RenderingSystem& renderer) { return renderer.mShadowMap.Get(); }
+    static ID3D12Resource* PostOutput(RenderingSystem& renderer) { return renderer.mPostOutput.Get(); }
     static std::vector<unsigned> VisibleIds(RenderingSystem& renderer)
     {
         auto ids = renderer.mCullingScene.VisibleIds;
@@ -207,6 +208,7 @@ try
     Submesh submesh; submesh.MaterialName="test"; submesh.IndexStart=0; submesh.IndexCount=static_cast<UINT>(indices.size());
     std::vector<Submesh> submeshes={submesh};
     SceneRenderContext scene;
+    scene.Post.Enabled = false; // Existing lighting/tessellation tests compare the unprocessed image.
     scene.VertexBufferView={vb.Resource()->GetGPUVirtualAddress(),UINT(vertices.size()*sizeof(Vertex)),sizeof(Vertex)};
     scene.IndexBufferView={ib.Resource()->GetGPUVirtualAddress(),UINT(indices.size()*sizeof(UINT)),DXGI_FORMAT_R32_UINT};
     scene.Materials=&materials; scene.Submeshes=&submeshes; scene.MaterialHeap=materialHeap.Get();
@@ -222,6 +224,7 @@ try
     ThrowIfFailed(device->CreateQueryHeap(&pipelineDesc, IID_PPV_ARGS(&pipelineQueries)));
     auto pipelineReadback = buffer(sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS), D3D12_HEAP_TYPE_READBACK);
     D3D12_QUERY_DATA_PIPELINE_STATISTICS pipeline = {};
+    auto postReadback = buffer(256 * 1024, D3D12_HEAP_TYPE_READBACK);
     auto render = [&]
     {
         commands->BeginQuery(pipelineQueries.Get(), D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
@@ -234,6 +237,12 @@ try
         target.pResource=outputReadback.Get(); target.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         target.PlacedFootprint.Footprint={texture.Format,256,256,1,1024};
         commands->CopyTextureRegion(&target,0,0,0,&source,nullptr);
+        auto* computed = ShadowTestAccess::PostOutput(renderer);
+        transition(computed, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        source.pResource = computed;
+        target.pResource = postReadback.Get();
+        commands->CopyTextureRegion(&target,0,0,0,&source,nullptr);
+        transition(computed, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         transition(output.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PRESENT);
         submit(); renderer.OnFrameComplete();
         void* pipelineData = nullptr;
@@ -246,6 +255,14 @@ try
         auto* bytes=static_cast<unsigned char*>(data);
         std::vector<unsigned char> image(bytes,bytes+range.End);
         outputReadback->Unmap(0,&none);
+        if (!scene.ObserveCulling)
+        {
+            ThrowIfFailed(postReadback->Map(0, &range, &data));
+            const bool same = memcmp(image.data(), data, image.size()) == 0;
+            postReadback->Unmap(0, &none);
+            Require(same, "Presentation must match compute output pixel-for-pixel");
+            Require(pipeline.CSInvocations >= 256 * 256, "Missing fullscreen compute work");
+        }
         return image;
     };
     scene.Shadows.Enabled=false;
@@ -319,6 +336,13 @@ try
         Require(pipeline.HSInvocations == 0 && pipeline.DSInvocations == 0, "Stationary camera retessellated");
     }
     Require(renderer.GetTessellationCacheStats().Updates == before, "Stationary cache update count");
+    const auto savedView = scene.View;
+    XMStoreFloat4x4(&scene.View, XMMatrixLookAtLH(XMLoadFloat3(&scene.EyePos),
+        XMVectorSet(1, 0, 0, 1), XMVectorSet(0, 1, 0, 0)));
+    render();
+    Require(pipeline.HSInvocations == 0 && pipeline.DSInvocations == 0,
+        "Rotation in place must reuse world-space geometry");
+    scene.View = savedView;
     // Force SO overflow, then verify exact query-driven growth instead of accepting a partial mesh.
     materials[0].TessellationParams = { 8,8,0,0.5f };
     render();
@@ -340,17 +364,22 @@ try
     scene.CacheTessellation = true;
     scene.Wireframe = false;
     scene.DebugViewMode = 1;
-    // Small movements are accumulated relative to the last capture; updates remain throttled.
-    scene.DeltaTime = 0.05f;
+    // Even sub-threshold movement must rebuild immediately, independent of elapsed time.
+    scene.DeltaTime = 0;
     UINT builds = 0, reuse = 0;
     for (int i = 0; i < 12; ++i)
     {
-        scene.EyePos.x += 0.02f;
+        if (i % 3 == 0) scene.EyePos.x += 0.0001f;
+        else if (i % 3 == 1) scene.EyePos.y += 0.0001f;
+        else scene.EyePos.z += 0.0001f;
         render();
         if (pipeline.HSInvocations > 0) ++builds;
         else ++reuse;
     }
-    Require(builds >= 2 && builds <= 3 && reuse >= 9, "Camera movement update interval incorrect");
+    Require(builds == 12 && reuse == 0, "Every position change must rebuild without a timer");
+    render();
+    Require(pipeline.HSInvocations == 0 && pipeline.DSInvocations == 0,
+        "Stopping camera must immediately reuse the completed mesh");
     scene.DeltaTime = 1;
     scene.UvOffset.x += 0.25f;
     render(); render(); render();
@@ -414,6 +443,63 @@ try
     scene.ObserveCulling = false; render();
     std::cout << "PASS: side observer pixels (green objects, yellow frustum), unchanged primary selection, "
         << "culled bounds toggle, None/Linear/Octree, moving camera, empty selection, return to main view\n";
+    scene.ShowCullingScene = false;
+    scene.EyePos = {6,6,-10};
+    XMStoreFloat4x4(&scene.View, XMMatrixLookAtLH(XMLoadFloat3(&scene.EyePos), XMVectorZero(), XMVectorSet(0,1,0,0)));
+    const auto originalPost = render();
+    scene.Post.Enabled = true;
+    scene.Post.VignetteStrength = 0;
+    scene.Post.ChromaticPixels = 0;
+    Require(render() == originalPost, "Zero-strength effects must preserve the image exactly");
+    scene.Post.VignetteStrength = 1;
+    const auto vignetteImage = render();
+    UINT darkerPixels = 0;
+    for (size_t i = 0; i < originalPost.size(); i += 4)
+    {
+        Require(vignetteImage[i] <= originalPost[i], "Vignette unexpectedly brightens pixels");
+        if (int(originalPost[i]) - int(vignetteImage[i]) > 5) ++darkerPixels;
+    }
+    Require(darkerPixels > 200, "Vignette has no measurable effect");
+    for (UINT y = 120; y < 136; ++y)
+        for (UINT x = 120; x < 136; ++x)
+            for (UINT channel = 0; channel < 3; ++channel)
+                Require(vignetteImage[(y*256+x)*4+channel] == originalPost[(y*256+x)*4+channel],
+                    "Vignette must preserve the center");
+    scene.Post.Vignette = false;
+    Require(render() == originalPost, "Independent vignette disable failed");
+    scene.Post.ChromaticPixels = 12;
+    const auto chromaticImage = render();
+    UINT chromaticPixels = 0;
+    for (size_t i = 0; i < originalPost.size(); i += 4)
+    {
+        Require(chromaticImage[i+1] == originalPost[i+1], "Chromatic aberration must preserve green channel");
+        if (std::abs(int(originalPost[i]) - int(chromaticImage[i])) > 3) ++chromaticPixels;
+    }
+    Require(chromaticPixels > 50, "Chromatic aberration has no measurable effect");
+    scene.Post.ChromaticAberration = false;
+    Require(render() == originalPost, "Independent chromatic disable failed");
+    scene.Post.ChromaticAberration = true;
+    scene.Post.Vignette = true;
+    const auto combinedPost = render();
+    Require(combinedPost != vignetteImage && combinedPost != chromaticImage, "Effects are not composed");
+    scene.Post.Enabled = false;
+    Require(render() == originalPost, "Master post-processing bypass failed");
+    scene.Post.BufferView = 1;
+    const auto albedoPost = render();
+    scene.Post.BufferView = 2;
+    const auto normalsPost = render();
+    scene.Post.BufferView = 3;
+    const auto depthPost = render();
+    Require(albedoPost != originalPost && normalsPost != albedoPost && depthPost != normalsPost,
+        "Post compute shader G-buffer views are missing");
+    // An empty scene has depth=1 everywhere: every quad pixel, not only its center, must be white.
+    scene.Shadows.ShowGround = false;
+    submeshes.clear();
+    const auto emptyDepth = render();
+    Require(std::all_of(emptyDepth.begin(), emptyDepth.end(), [](unsigned char c) { return c == 255; }),
+        "Fullscreen quad misses pixels in an empty depth view");
+    std::cout << "PASS: compute output equals presentation, post-processing quad, G-buffer views, zero-strength identity, master/individual bypass, "
+        << "vignette (" << darkerPixels << " pixels), chromatic (" << chromaticPixels << " pixels), combined effects\n";
     UINT errors=0;
     if(messages) for(UINT64 i=0;i<messages->GetNumStoredMessages();++i)
     {

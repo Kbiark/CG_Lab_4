@@ -212,6 +212,9 @@ private:
     ParticleSettings mParticleSettings = [] { ParticleSettings p; p.Visible = false; return p; }();
     bool mParticleKeysDown[6] = {};
     ShadowSettings mShadowSettings;
+    PostProcessingSettings mPostSettings;
+    bool mPostKeysDown[6] = {};
+    bool mPostStatusVisible = true;
     bool mShadowKeysDown[5] = {};
 
     // Математика для камеры

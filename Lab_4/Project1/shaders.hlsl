@@ -234,7 +234,6 @@ GeometryPSInput GeometryDS(
     posW += normalW * displacement;
 
 #ifdef CACHE_TESSELLATION
-    // Stream output stores world space, independent of the current camera/cascade.
     output.PosH = float4(posW, 1.0f);
 #else
     output.PosH = mul(float4(posW, 1.0f), mWorldViewProj);
@@ -525,19 +524,4 @@ float4 PointLightVolumePS(PointLightVolumePSInput pin) : SV_Target
     return float4(color, 1.0f);
 }
 
-FullscreenPSInput FinalVS(uint vertexId : SV_VertexID)
-{
-    return LightingVS(vertexId);
-}
-
-float4 FinalPS(FullscreenPSInput pin) : SV_Target
-{
-    float3 hdrColor = gLightingBuffer.Sample(gSampler, pin.TexC).rgb;
-    hdrColor *= 1.08f;
-
-    // Reinhard tone mapping keeps additive deferred lighting from clipping to pure white.
-    float3 mapped = hdrColor / (hdrColor + 1.0f);
-    mapped = pow(saturate(mapped), 1.0f / 2.2f);
-
-    return float4(mapped, 1.0f);
-}
+#include "post_processing.hlsli"

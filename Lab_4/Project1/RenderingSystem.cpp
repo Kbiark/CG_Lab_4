@@ -383,6 +383,33 @@ void RenderingSystem::Render(
 
     mGBuffer.TransitionLightingToShaderResource(commandList);
 
+    ID3D12Resource* postInputs[] = { mGBuffer.GetAlbedoResource(), mGBuffer.GetNormalResource(),
+        mGBuffer.GetDepthResource(), mGBuffer.GetLightingResource() };
+    D3D12_RESOURCE_BARRIER postBarriers[5];
+    for (UINT i = 0; i < 4; ++i)
+        postBarriers[i] = TransitionBarrier(postInputs[i], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    postBarriers[4] = TransitionBarrier(mPostOutput.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    commandList->ResourceBarrier(5, postBarriers);
+    commandList->SetComputeRootSignature(mPostRootSignature.Get());
+    commandList->SetPipelineState(mPostPso.Get());
+    auto postHandle = mDeferredHeap->GetGPUDescriptorHandleForHeapStart();
+    commandList->SetComputeRootDescriptorTable(0, postHandle);
+    postHandle.ptr += 7 * mCbvSrvUavDescriptorSize;
+    commandList->SetComputeRootDescriptorTable(2, postHandle);
+    const float postConstants[] = {
+        scene.Post.Enabled && scene.Post.Vignette ? (std::clamp)(scene.Post.VignetteStrength, 0.0f, 1.0f) : 0,
+        scene.Post.Enabled && scene.Post.ChromaticAberration ? (std::clamp)(scene.Post.ChromaticPixels, 0.0f, 12.0f) : 0,
+        1.0f / mWidth, 1.0f / mHeight,
+        float((std::min)(scene.Post.BufferView, 3u)), scene.Proj._33, scene.Proj._43, 1.08f
+    };
+    commandList->SetComputeRoot32BitConstants(1, _countof(postConstants), postConstants, 0);
+    commandList->Dispatch((mWidth + 7) / 8, (mHeight + 7) / 8, 1);
+    for (auto& barrier : postBarriers)
+        std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    commandList->ResourceBarrier(5, postBarriers);
+
     D3D12_RESOURCE_BARRIER backBufferBarrier =
         TransitionBarrier(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
     commandList->ResourceBarrier(1, &backBufferBarrier);
@@ -393,10 +420,13 @@ void RenderingSystem::Render(
     const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
     commandList->ClearRenderTargetView(backBufferView, clearColor, 0, nullptr);
 
-    D3D12_GPU_DESCRIPTOR_HANDLE lightingSrvHandle = mDeferredHeap->GetGPUDescriptorHandleForHeapStart();
-    lightingSrvHandle.ptr += 3 * mCbvSrvUavDescriptorSize;
-    commandList->SetGraphicsRootDescriptorTable(0, lightingSrvHandle);
-    commandList->DrawInstanced(3, 1, 0, 0);
+    postHandle.ptr -= mCbvSrvUavDescriptorSize; // Slot 6: computed image SRV.
+    commandList->SetGraphicsRootDescriptorTable(0, postHandle);
+    const D3D12_VERTEX_BUFFER_VIEW noVertexBuffers[2] = {};
+    commandList->IASetVertexBuffers(0, 2, noVertexBuffers);
+    commandList->IASetIndexBuffer(nullptr);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    commandList->DrawInstanced(4, 1, 0, 0);
     if (scene.ShowCullingScene && scene.ObserveCulling)
         RenderCullingObserver(commandList, backBufferView, scene);
 }
@@ -467,7 +497,6 @@ void RenderingSystem::OnFrameComplete()
 
 void RenderingSystem::UpdateTessellationCache(ID3D12GraphicsCommandList* commands, const SceneRenderContext& scene)
 {
-    ++mTessFrame;
     auto makeBuffer = [&](UINT64 bytes, D3D12_HEAP_TYPE type, D3D12_RESOURCE_STATES state,
         ComPtr<ID3D12Resource>& resource)
     {
@@ -527,7 +556,6 @@ void RenderingSystem::UpdateTessellationCache(ID3D12GraphicsCommandList* command
             mesh.IndexStart = submesh.IndexStart;
             mesh.IndexCount = submesh.IndexCount;
         }
-        mesh.Age += (std::max)(0.0f, scene.DeltaTime);
         ObjectConstants constants = {};
         constants.uvTiling = material->Tiling;
         constants.uvOffset = { scene.UvOffset.x + material->StaticUvOffset.x, scene.UvOffset.y + material->StaticUvOffset.y };
@@ -537,19 +565,15 @@ void RenderingSystem::UpdateTessellationCache(ID3D12GraphicsCommandList* command
         const float dx = scene.EyePos.x - last.eyePosAndDisplacementScale.x;
         const float dy = scene.EyePos.y - last.eyePosAndDisplacementScale.y;
         const float dz = scene.EyePos.z - last.eyePosAndDisplacementScale.z;
-        const bool changed = !mesh.Captured || dx * dx + dy * dy + dz * dz >= 0.0001f ||
+        // Camera rotation changes only the draw matrices, not the cached world-space mesh.
+        const bool changed = !mesh.Captured || dx != 0.0f || dy != 0.0f || dz != 0.0f ||
             material->DisplacementTexture.Get() != mesh.HeightMap ||
             constants.eyePosAndDisplacementScale.w != last.eyePosAndDisplacementScale.w ||
             memcmp(&constants.uvTiling, &last.uvTiling, sizeof(XMFLOAT2)) != 0 ||
             memcmp(&constants.uvOffset, &last.uvOffset, sizeof(XMFLOAT2)) != 0 ||
             memcmp(&constants.tessellationParams, &last.tessellationParams, sizeof(XMFLOAT4)) != 0;
-        // At least one reused frame even when the frame time exceeds the interval.
-        const bool due = mesh.LastUpdateFrame == 0 ||
-            (mesh.Age >= TessellationUpdateInterval && mTessFrame > mesh.LastUpdateFrame + 1);
-        if (scene.CacheTessellation && changed && due && !mesh.Pending)
+        if (scene.CacheTessellation && changed && !mesh.Pending)
         {
-            mesh.Age = 0;
-            mesh.LastUpdateFrame = mTessFrame;
             const UINT64 initial = (std::max)(4096ull, UINT64(submesh.IndexCount) * CachedVertexStride * 2);
             const UINT64 needed = (std::max)(initial, mesh.RequiredBytes);
             UINT64 used = 0;
@@ -1047,21 +1071,43 @@ void RenderingSystem::BuildRootSignatures()
 
     D3D12_DESCRIPTOR_RANGE finalRange = {};
     finalRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    finalRange.NumDescriptors = 1;
+    finalRange.NumDescriptors = 4;
     finalRange.BaseShaderRegister = 0;
     finalRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER finalParam = {};
-    finalParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    finalParam.DescriptorTable.NumDescriptorRanges = 1;
-    finalParam.DescriptorTable.pDescriptorRanges = &finalRange;
-    finalParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_PARAMETER finalParams[3] = {};
+    finalParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    finalParams[0].DescriptorTable = { 1, &finalRange };
+    finalParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    finalParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    finalParams[1].Constants = { 2, 0, 8 };
+    finalParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_DESCRIPTOR_RANGE postUav = {};
+    postUav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    postUav.NumDescriptors = 1;
+    finalParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    finalParams[2].DescriptorTable = { 1, &postUav };
+    D3D12_STATIC_SAMPLER_DESC postSamplers[] = { pointSampler, pointSampler };
+    postSamplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    postSamplers[1].ShaderRegister = 1;
+    for (auto& sampler : postSamplers) sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC finalDesc = {};
+    finalDesc.NumParameters = 3;
+    finalDesc.pParameters = finalParams;
+    finalDesc.NumStaticSamplers = 2;
+    finalDesc.pStaticSamplers = postSamplers;
+    finalDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    serialized.Reset();
+    error.Reset();
+    ThrowIfFailed(D3D12SerializeRootSignature(&finalDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error));
+    ThrowIfFailed(mDevice->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&mPostRootSignature)));
+
+    finalRange.NumDescriptors = 1;
+    finalParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     finalDesc.NumParameters = 1;
-    finalDesc.pParameters = &finalParam;
-    finalDesc.NumStaticSamplers = 1;
-    finalDesc.pStaticSamplers = &pointSampler;
+    finalDesc.NumStaticSamplers = 0;
     finalDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
     serialized.Reset();
@@ -1309,12 +1355,16 @@ void RenderingSystem::BuildPsos(DXGI_FORMAT backBufferFormat)
         ThrowIfFailed(hr, "Create final PSO failed");
     }
     StartupLog("Create final PSO ok");
+    D3D12_COMPUTE_PIPELINE_STATE_DESC postPso = {};
+    postPso.pRootSignature = mPostRootSignature.Get();
+    postPso.CS = { mPostCs->GetBufferPointer(), mPostCs->GetBufferSize() };
+    ThrowIfFailed(mDevice->CreateComputePipelineState(&postPso, IID_PPV_ARGS(&mPostPso)));
 }
 
 void RenderingSystem::BuildDeferredDescriptorHeap()
 {
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = 6;
+    heapDesc.NumDescriptors = 8;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(mDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mDeferredHeap)));
@@ -1350,6 +1400,20 @@ void RenderingSystem::BuildDeferredDescriptorHeap()
     shadowSrv.Texture2DArray.MipLevels = 1;
     shadowSrv.Texture2DArray.ArraySize = ShadowCascades::Count;
     mDevice->CreateShaderResourceView(mShadowMap.Get(), &shadowSrv, handle);
+
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC output = mGBuffer.GetAlbedoResource()->GetDesc();
+    output.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    ThrowIfFailed(mDevice->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &output,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&mPostOutput)));
+    handle.ptr += mCbvSrvUavDescriptorSize;
+    mDevice->CreateShaderResourceView(mPostOutput.Get(), &albedoSrv, handle);
+    handle.ptr += mCbvSrvUavDescriptorSize;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC outputUav = {};
+    outputUav.Format = output.Format;
+    outputUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    mDevice->CreateUnorderedAccessView(mPostOutput.Get(), nullptr, &outputUav, handle);
 }
 
 void RenderingSystem::BuildFrameConstants()
@@ -1392,6 +1456,7 @@ void RenderingSystem::BuildShaders()
     mPointLightPs = d3dUtil::CompileShader(shaderFile, nullptr, "PointLightVolumePS", "ps_5_0");
     mFinalVs = d3dUtil::CompileShader(shaderFile, nullptr, "FinalVS", "vs_5_0");
     mFinalPs = d3dUtil::CompileShader(shaderFile, nullptr, "FinalPS", "ps_5_0");
+    mPostCs = d3dUtil::CompileShader(shaderFile, nullptr, "PostCS", "cs_5_0");
 }
 
 void RenderingSystem::BuildPointLightVolumeMesh()

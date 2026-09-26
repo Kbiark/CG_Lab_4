@@ -137,6 +137,7 @@
     <None Include="sponza.mtl" />
     <None Include="particles.hlsl" />
     <None Include="shadow_sampling.hlsli" />
+    <None Include="post_processing.hlsli" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

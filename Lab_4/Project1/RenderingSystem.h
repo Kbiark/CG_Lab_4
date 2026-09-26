@@ -49,6 +49,16 @@ struct SpotLight
     float Intensity = 6.0f;
 };
 
+struct PostProcessingSettings
+{
+    bool Enabled = true;
+    bool Vignette = true;
+    bool ChromaticAberration = true;
+    float VignetteStrength = 0.5f;
+    float ChromaticPixels = 3.0f;
+    UINT BufferView = 0; // 0: final image, 1: albedo, 2: normals, 3: depth.
+};
+
 struct SceneRenderContext
 {
     D3D12_VERTEX_BUFFER_VIEW VertexBufferView = {};
@@ -74,6 +84,7 @@ struct SceneRenderContext
     ShadowSettings Shadows;
     DirectX::BoundingBox SceneBounds;
     bool CacheTessellation = true;
+    PostProcessingSettings Post;
 };
 
 struct TessellationCacheStats
@@ -134,7 +145,6 @@ public:
     // Call only after the frame fence has completed.
     void OnFrameComplete();
     const TessellationCacheStats& GetTessellationCacheStats() const { return mTessStats; }
-    static constexpr float TessellationUpdateInterval = 0.2f;
     size_t GetOctreeNodeCount() const { return mCullingScene.NodeCount(); }
     size_t GetSceneObjectCount() const { return mCullingScene.Objects.size(); }
     const std::array<float, 4>& GetCascadeSplits() const { return mCascades.Splits; }
@@ -161,15 +171,12 @@ private:
         UINT64 ActiveBytes = 0, ScratchBytes = 0, RequiredBytes = 0;
         UINT VertexCount = 0;
         bool Pending = false, Captured = false;
-        float Age = TessellationUpdateInterval;
-        UINT64 LastUpdateFrame = 0;
         ObjectConstants LastConstants = {};
         ID3D12Resource* HeightMap = nullptr;
         UINT IndexStart = 0, IndexCount = 0;
     };
     std::vector<TessellationMesh> mTessMeshes;
     TessellationCacheStats mTessStats;
-    UINT64 mTessFrame = 0;
     D3D12_VERTEX_BUFFER_VIEW mTessSourceVb = {};
     D3D12_INDEX_BUFFER_VIEW mTessSourceIb = {};
     ComPtr<ID3D12QueryHeap> mTessQueries;
@@ -291,6 +298,10 @@ private:
     ComPtr<ID3D12RootSignature> mLightingRootSignature;
     ComPtr<ID3D12RootSignature> mPointLightRootSignature;
     ComPtr<ID3D12RootSignature> mFinalRootSignature;
+    ComPtr<ID3D12RootSignature> mPostRootSignature;
+    ComPtr<ID3D12Resource> mPostOutput;
+    ComPtr<ID3D12PipelineState> mPostPso;
+    ComPtr<ID3DBlob> mPostCs;
 
     ComPtr<ID3D12PipelineState> mGeometryPso;
     ComPtr<ID3D12PipelineState> mGeometryWireframePso;

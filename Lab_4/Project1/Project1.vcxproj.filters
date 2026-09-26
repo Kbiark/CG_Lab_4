@@ -119,6 +119,7 @@
       <Filter>Shaders</Filter>
     </None>
     <None Include="shaders.hlsl" />
+    <None Include="post_processing.hlsli" />
     <None Include="sponza.mtl" />
   </ItemGroup>
 </Project>

@@ -1258,6 +1258,27 @@ void DirectXApp::OnResize() {
 // Обработка клавиатуры
 void DirectXApp::OnKeyDown(WPARAM wParam)
 {
+    if (wParam >= '0' && wParam <= '5' && !mPostKeysDown[wParam - '0'])
+    {
+        mPostKeysDown[wParam - '0'] = true;
+        mPostStatusVisible = true;
+        if (wParam == '0') mPostSettings.Enabled = !mPostSettings.Enabled;
+        if (wParam == '1') mPostSettings.Vignette = !mPostSettings.Vignette;
+        if (wParam == '2') mPostSettings.ChromaticAberration = !mPostSettings.ChromaticAberration;
+        if (wParam == '3') mPostSettings.BufferView = (mPostSettings.BufferView + 1) % 4;
+        if (wParam == '4')
+        {
+            mPostSettings.VignetteStrength += 0.25f;
+            if (mPostSettings.VignetteStrength > 1) mPostSettings.VignetteStrength = 0;
+        }
+        if (wParam == '5')
+        {
+            mPostSettings.ChromaticPixels += 3;
+            if (mPostSettings.ChromaticPixels > 12) mPostSettings.ChromaticPixels = 0;
+        }
+    }
+    if (wParam == 'T' || wParam == 'J' || wParam == 'K' || wParam == 'L' || wParam == 'U' || wParam == 'G')
+        mPostStatusVisible = false;
     if (wParam == VK_F10 && !mF10KeyDown)
     {
         mF10KeyDown = true;
@@ -1345,6 +1366,7 @@ void DirectXApp::OnKeyDown(WPARAM wParam)
 
 void DirectXApp::OnKeyUp(WPARAM wParam)
 {
+    if (wParam >= '0' && wParam <= '5') mPostKeysDown[wParam - '0'] = false;
     if (wParam == VK_F10) mF10KeyDown = false;
     if (wParam == VK_F11) mF11KeyDown = false;
     if (wParam == 'T') mTessellationKeyDown = false;
@@ -1402,6 +1424,19 @@ void DirectXApp::CalculateFrameStats() {
         float mspf = 1000.0f / fps;
 
         std::wstring windowText = mMainWndCaption;
+        if (mPostStatusVisible && !mShowCullingScene && !mParticleSettings.Visible)
+        {
+            const wchar_t* views[] = { L"Final", L"Albedo", L"Normals", L"Depth" };
+            std::wostringstream title;
+            title << L"HW7 FX " << (mPostSettings.Enabled ? L"ON" : L"OFF")
+                << L" | Vignette " << (mPostSettings.Vignette ? L"ON " : L"OFF ") << mPostSettings.VignetteStrength
+                << L" | Chromatic " << (mPostSettings.ChromaticAberration ? L"ON " : L"OFF ") << mPostSettings.ChromaticPixels
+                << L"px | " << views[mPostSettings.BufferView] << L" | " << int(fps) << L" FPS";
+            SetWindowText(window.GetHandle(), title.str().c_str());
+            mFrameCount = 0;
+            mTimeElapsed += 1.0f;
+            return;
+        }
         std::wstring tessStatus;
         if (mRenderingSystem)
         {
@@ -1793,6 +1828,7 @@ void DirectXApp::Draw(const Timer& gt)
     scene.DeltaTime = gt.DeltaTime();
     scene.Shadows = mShadowSettings;
     scene.CacheTessellation = mTessellationCacheEnabled;
+    scene.Post = mPostSettings;
     scene.SceneBounds = BoundingBox(mSceneCenter, XMFLOAT3(mSceneExtent.x * 0.5f, mSceneExtent.y * 0.5f, mSceneExtent.z * 0.5f));
 
     mRenderingSystem->Render(
