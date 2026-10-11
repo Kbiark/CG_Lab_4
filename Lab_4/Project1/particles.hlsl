@@ -128,7 +128,7 @@ GBufferOutput ParticlePS(Pixel input)
     float3 normal = input.Local.x * CameraRight.xyz + input.Local.y * CameraUp.xyz
         + sqrt(saturate(1.0 - r2)) * facing;
     GBufferOutput output;
-    output.Albedo = float4(input.Color.rgb, 1);
+    output.Albedo = float4(input.Color.rgb, 0); // Opaque dielectric; alpha now stores metallic.
     output.Normal = float4(normalize(normal), 1);
     return output;
 }

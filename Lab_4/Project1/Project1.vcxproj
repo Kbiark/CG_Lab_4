@@ -138,6 +138,10 @@
     <None Include="particles.hlsl" />
     <None Include="shadow_sampling.hlsli" />
     <None Include="post_processing.hlsli" />
+    <None Include="pbr.hlsli" />
+    <None Include="Assets\IBL\IntegrationMap.dds" />
+    <None Include="Assets\IBL\IrradianceMap_BC6U.dds" />
+    <None Include="Assets\IBL\PreFilteredEnvMap_BC6U.dds" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

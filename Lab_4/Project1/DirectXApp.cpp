@@ -1262,6 +1262,7 @@ void DirectXApp::OnKeyDown(WPARAM wParam)
     {
         mPostKeysDown[wParam - '0'] = true;
         mPostStatusVisible = true;
+        mPbrStatusVisible = false;
         if (wParam == '0') mPostSettings.Enabled = !mPostSettings.Enabled;
         if (wParam == '1') mPostSettings.Vignette = !mPostSettings.Vignette;
         if (wParam == '2') mPostSettings.ChromaticAberration = !mPostSettings.ChromaticAberration;
@@ -1277,8 +1278,24 @@ void DirectXApp::OnKeyDown(WPARAM wParam)
             if (mPostSettings.ChromaticPixels > 12) mPostSettings.ChromaticPixels = 0;
         }
     }
+    if (wParam >= '6' && wParam <= '9' && !mPbrKeysDown[wParam - '6'])
+    {
+        mPbrKeysDown[wParam - '6'] = true;
+        mPbrStatusVisible = true;
+        if (wParam == '8') mIblEnabled = !mIblEnabled;
+        for (auto& material : mMaterials)
+        {
+            if (wParam == '6') material.Roughness = material.Roughness >= 0.99f ? 0.1f : (std::min)(1.0f, material.Roughness + 0.2f);
+            if (wParam == '7') material.Metallic = material.Metallic >= 0.99f ? 0.0f : material.Metallic + 0.5f;
+            if (wParam == '9') { material.Roughness = 0.6f; material.Metallic = 0; }
+        }
+        if (wParam == '9') mIblEnabled = true;
+    }
     if (wParam == 'T' || wParam == 'J' || wParam == 'K' || wParam == 'L' || wParam == 'U' || wParam == 'G')
+    {
         mPostStatusVisible = false;
+        mPbrStatusVisible = false;
+    }
     if (wParam == VK_F10 && !mF10KeyDown)
     {
         mF10KeyDown = true;
@@ -1367,6 +1384,7 @@ void DirectXApp::OnKeyDown(WPARAM wParam)
 void DirectXApp::OnKeyUp(WPARAM wParam)
 {
     if (wParam >= '0' && wParam <= '5') mPostKeysDown[wParam - '0'] = false;
+    if (wParam >= '6' && wParam <= '9') mPbrKeysDown[wParam - '6'] = false;
     if (wParam == VK_F10) mF10KeyDown = false;
     if (wParam == VK_F11) mF11KeyDown = false;
     if (wParam == 'T') mTessellationKeyDown = false;
@@ -1424,6 +1442,17 @@ void DirectXApp::CalculateFrameStats() {
         float mspf = 1000.0f / fps;
 
         std::wstring windowText = mMainWndCaption;
+        if (mPbrStatusVisible && !mShowCullingScene && !mParticleSettings.Visible && !mMaterials.empty())
+        {
+            std::wostringstream title;
+            title << L"HW8 PBR | Roughness " << std::fixed << std::setprecision(2) << mMaterials[0].Roughness
+                << L" | Metallic " << mMaterials[0].Metallic << L" | IBL " << (mIblEnabled ? L"ON" : L"OFF")
+                << L" | " << int(fps) << L" FPS";
+            SetWindowText(window.GetHandle(), title.str().c_str());
+            mFrameCount = 0;
+            mTimeElapsed += 1.0f;
+            return;
+        }
         if (mPostStatusVisible && !mShowCullingScene && !mParticleSettings.Visible)
         {
             const wchar_t* views[] = { L"Final", L"Albedo", L"Normals", L"Depth" };
@@ -1829,6 +1858,7 @@ void DirectXApp::Draw(const Timer& gt)
     scene.Shadows = mShadowSettings;
     scene.CacheTessellation = mTessellationCacheEnabled;
     scene.Post = mPostSettings;
+    scene.IblEnabled = mIblEnabled;
     scene.SceneBounds = BoundingBox(mSceneCenter, XMFLOAT3(mSceneExtent.x * 0.5f, mSceneExtent.y * 0.5f, mSceneExtent.z * 0.5f));
 
     mRenderingSystem->Render(

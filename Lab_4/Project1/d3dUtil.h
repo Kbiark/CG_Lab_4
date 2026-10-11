@@ -14,4 +14,7 @@ namespace d3dUtil
         const std::string& target);
 
     UINT CalcConstantBufferByteSize(UINT byteSize);
+    Microsoft::WRL::ComPtr<ID3D12Resource> LoadIblDds(
+        ID3D12Device* device, ID3D12GraphicsCommandList* commands, const std::wstring& filename,
+        Microsoft::WRL::ComPtr<ID3D12Resource>& upload);
 }

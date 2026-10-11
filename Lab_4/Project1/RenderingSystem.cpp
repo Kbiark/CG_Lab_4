@@ -267,6 +267,7 @@ bool RenderingSystem::Initialize(
     BuildPsos(backBufferFormat);
     StartupLog("RenderingSystem BuildPsos ok");
     StartupLog("RenderingSystem BuildDeferredDescriptorHeap begin");
+    BuildIblResources();
     BuildDeferredDescriptorHeap();
     StartupLog("RenderingSystem BuildDeferredDescriptorHeap ok");
     StartupLog("RenderingSystem BuildFrameConstants begin");
@@ -351,6 +352,9 @@ void RenderingSystem::Render(
     auto shadowSrv = gbufferSrvHandle;
     shadowSrv.ptr += 5 * mCbvSrvUavDescriptorSize;
     commandList->SetGraphicsRootDescriptorTable(2, shadowSrv);
+    auto iblSrv = gbufferSrvHandle;
+    iblSrv.ptr += 8 * mCbvSrvUavDescriptorSize;
+    commandList->SetGraphicsRootDescriptorTable(3, iblSrv);
     commandList->DrawInstanced(3, 1, 0, 0);
 
     // Dynamic point lights are accumulated with additive blending by drawing one light volume per source.
@@ -468,6 +472,8 @@ void RenderingSystem::RenderModels(ID3D12GraphicsCommandList* commands, const Sc
         constants.eyePosAndDisplacementScale = { scene.EyePos.x, scene.EyePos.y, scene.EyePos.z, material->DisplacementScale };
         constants.tessellationParams = material->TessellationParams;
         constants.normalParams = { material->NormalStrength, 2048, 2048, float(scene.DebugViewMode) };
+        constants.materialParams = { (std::clamp)(material->Roughness, 0.045f, 1.0f),
+            (std::clamp)(material->Metallic, 0.0f, 1.0f), 0, 0 };
         // Each draw/cascade needs its own slot: GPU reads these after CPU finishes recording.
         BindObjectConstants(commands, constantBase + i, constants);
         auto handle = scene.MaterialHeap->GetGPUDescriptorHandleForHeapStart();
@@ -1000,7 +1006,7 @@ void RenderingSystem::BuildRootSignatures()
     lightingRanges[1].BaseShaderRegister = 0;
     lightingRanges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-    D3D12_ROOT_PARAMETER lightingParams[3] = {};
+    D3D12_ROOT_PARAMETER lightingParams[4] = {};
     lightingParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     lightingParams[0].DescriptorTable.NumDescriptorRanges = 1;
     lightingParams[0].DescriptorTable.pDescriptorRanges = &lightingRanges[0];
@@ -1016,6 +1022,13 @@ void RenderingSystem::BuildRootSignatures()
     lightingParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     lightingParams[2].DescriptorTable = { 1, &shadowRange };
     lightingParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_DESCRIPTOR_RANGE iblRange = {};
+    iblRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    iblRange.NumDescriptors = 3;
+    iblRange.BaseShaderRegister = 4;
+    lightingParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    lightingParams[3].DescriptorTable = { 1, &iblRange };
+    lightingParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_STATIC_SAMPLER_DESC pointSampler = {};
     pointSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
@@ -1024,7 +1037,10 @@ void RenderingSystem::BuildRootSignatures()
     pointSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     pointSampler.ShaderRegister = 0;
     pointSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    D3D12_STATIC_SAMPLER_DESC lightingSamplers[] = { pointSampler, pointSampler };
+    D3D12_STATIC_SAMPLER_DESC lightingSamplers[] = { pointSampler, pointSampler, pointSampler };
+    lightingSamplers[2].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    lightingSamplers[2].ShaderRegister = 2;
+    lightingSamplers[2].MaxLOD = D3D12_FLOAT32_MAX;
     lightingSamplers[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
     lightingSamplers[1].AddressU = lightingSamplers[1].AddressV = lightingSamplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
     lightingSamplers[1].BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE;
@@ -1032,9 +1048,9 @@ void RenderingSystem::BuildRootSignatures()
     lightingSamplers[1].ShaderRegister = 1;
 
     D3D12_ROOT_SIGNATURE_DESC lightingDesc = {};
-    lightingDesc.NumParameters = 3;
+    lightingDesc.NumParameters = 4;
     lightingDesc.pParameters = lightingParams;
-    lightingDesc.NumStaticSamplers = 2;
+    lightingDesc.NumStaticSamplers = 3;
     lightingDesc.pStaticSamplers = lightingSamplers;
     lightingDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -1361,10 +1377,43 @@ void RenderingSystem::BuildPsos(DXGI_FORMAT backBufferFormat)
     ThrowIfFailed(mDevice->CreateComputePipelineState(&postPso, IID_PPV_ARGS(&mPostPso)));
 }
 
+void RenderingSystem::BuildIblResources()
+{
+    ComPtr<ID3D12CommandQueue> queue;
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    ThrowIfFailed(mDevice->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue)));
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ThrowIfFailed(mDevice->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
+    ComPtr<ID3D12GraphicsCommandList> commands;
+    ThrowIfFailed(mDevice->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commands)));
+    auto folder = std::filesystem::path(L"../Project1/Assets/IBL");
+    if (!std::filesystem::exists(folder)) folder = GetExeDirectory() / ".." / "Project1" / "Assets" / "IBL";
+    std::array<ComPtr<ID3D12Resource>, 3> uploads;
+    mIrradianceMap = d3dUtil::LoadIblDds(mDevice.Get(), commands.Get(), (folder / "IrradianceMap_BC6U.dds").wstring(), uploads[0]);
+    mPrefilterMap = d3dUtil::LoadIblDds(mDevice.Get(), commands.Get(), (folder / "PreFilteredEnvMap_BC6U.dds").wstring(), uploads[1]);
+    mBrdfLut = d3dUtil::LoadIblDds(mDevice.Get(), commands.Get(), (folder / "IntegrationMap.dds").wstring(), uploads[2]);
+    if (mIrradianceMap->GetDesc().DepthOrArraySize != 6 || mPrefilterMap->GetDesc().DepthOrArraySize != 6 ||
+        mPrefilterMap->GetDesc().MipLevels < 2 || mBrdfLut->GetDesc().DepthOrArraySize != 1)
+        throw std::runtime_error("IBL requires two cubemaps (prefiltered with mips) and a 2D BRDF LUT");
+    ThrowIfFailed(commands->Close());
+    ID3D12CommandList* lists[] = { commands.Get() };
+    queue->ExecuteCommandLists(1, lists);
+    ComPtr<ID3D12Fence> fence;
+    ThrowIfFailed(mDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
+    std::unique_ptr<void, decltype(&CloseHandle)> event(CreateEvent(nullptr, FALSE, FALSE, nullptr), CloseHandle);
+    if (!event) ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()));
+    ThrowIfFailed(queue->Signal(fence.Get(), 1));
+    ThrowIfFailed(fence->SetEventOnCompletion(1, event.get()));
+    if (WaitForSingleObject(event.get(), 60000) != WAIT_OBJECT_0)
+        throw std::runtime_error("IBL upload did not complete");
+    StartupLog("IBL: irradiance cube, prefiltered cube with " +
+        std::to_string(mPrefilterMap->GetDesc().MipLevels) + " mips, BRDF LUT uploaded");
+}
+
 void RenderingSystem::BuildDeferredDescriptorHeap()
 {
     D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-    heapDesc.NumDescriptors = 8;
+    heapDesc.NumDescriptors = 11;
     heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     ThrowIfFailed(mDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&mDeferredHeap)));
@@ -1414,6 +1463,24 @@ void RenderingSystem::BuildDeferredDescriptorHeap()
     outputUav.Format = output.Format;
     outputUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     mDevice->CreateUnorderedAccessView(mPostOutput.Get(), nullptr, &outputUav, handle);
+    for (auto* resource : { mIrradianceMap.Get(), mPrefilterMap.Get(), mBrdfLut.Get() })
+    {
+        handle.ptr += mCbvSrvUavDescriptorSize;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+        srv.Format = resource->GetDesc().Format;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        if (resource->GetDesc().DepthOrArraySize == 6)
+        {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            srv.TextureCube.MipLevels = resource->GetDesc().MipLevels;
+        }
+        else
+        {
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv.Texture2D.MipLevels = resource->GetDesc().MipLevels;
+        }
+        mDevice->CreateShaderResourceView(resource, &srv, handle);
+    }
 }
 
 void RenderingSystem::BuildFrameConstants()
@@ -1571,6 +1638,7 @@ void RenderingSystem::UpdateFrameConstants(const SceneRenderContext& scene)
     frame.ShadowParams = { scene.Shadows.Enabled ? 1.0f : 0.0f, float((std::min)(scene.Shadows.PcfRadius, 2u)),
         1.0f / ShadowCascades::Resolution, scene.Shadows.ShowCascades ? 1.0f : 0.0f };
     frame.ShadowConfig = { mCascades.Near, ShadowCascades::BlendFraction, 0.00008f, 0.9f };
+    frame.IblParams = { scene.IblEnabled ? 1.0f : 0.0f, 1.0f, float(mPrefilterMap->GetDesc().MipLevels - 1), 0 };
     frame.CameraPosition = XMFLOAT4(scene.EyePos.x, scene.EyePos.y, scene.EyePos.z, 1.0f);
     frame.LightCounts = XMFLOAT4(
         static_cast<float>(mDirectionalLights.size()),

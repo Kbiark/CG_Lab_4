@@ -215,6 +215,9 @@ private:
     PostProcessingSettings mPostSettings;
     bool mPostKeysDown[6] = {};
     bool mPostStatusVisible = true;
+    bool mIblEnabled = true;
+    bool mPbrStatusVisible = true;
+    bool mPbrKeysDown[4] = {};
     bool mShadowKeysDown[5] = {};
 
     // Математика для камеры

@@ -18,6 +18,7 @@ cbuffer cbPerObject : register(b0)
     float4 eyePosAndDisplacementScale;
     float4 tessellationParams; // maxTF, minTF, nearDistance, farDistance
     float4 normalParams; // normalStrength, mapWidth, mapHeight, debugViewMode
+    float4 materialParams; // roughness, metallic, padding.
 };
 
 struct DirectionalLightGpu
@@ -53,6 +54,7 @@ cbuffer cbFrame : register(b0)
     float4 gCascadeSplits;
     float4 gShadowParams; // enabled, PCF radius, inverse map resolution, debug cascades
     float4 gShadowConfig; // near plane, blend fraction, receiver bias, distance fade start
+    float4 gIblParams; // enabled, intensity, maximum reflection mip, padding.
 };
 
 cbuffer cbPointLight : register(b1)
@@ -308,8 +310,8 @@ GeometryPSOutput GroundPS(GeometryPSInput pin)
 {
     GeometryPSOutput output;
     float checker = frac((floor(pin.TexC.x * 0.5) + floor(pin.TexC.y * 0.5)) * 0.5) * 2;
-    output.Albedo = float4(lerp(float3(0.25, 0.29, 0.31), float3(0.35, 0.39, 0.4), checker), 1);
-    output.Normal = float4(0, 1, 0, 1);
+    output.Albedo = float4(lerp(float3(0.25, 0.29, 0.31), float3(0.35, 0.39, 0.4), checker), 0);
+    output.Normal = float4(0, 1, 0, 0.8f);
     return output;
 }
 
@@ -345,8 +347,11 @@ GeometryPSOutput GeometryPS(GeometryPSInput pin)
             1.0f);
     }
 
-    output.Albedo = albedo;
-    output.Normal = float4(normalW, 1.0f);
+    // Color textures are sRGB; normals and material parameters are linear data.
+    float3 linearAlbedo = normalParams.w >= 1.5f ? albedo.rgb :
+        lerp(albedo.rgb / 12.92f, pow((albedo.rgb + 0.055f) / 1.055f, 2.4f), step(0.04045f, albedo.rgb));
+    output.Albedo = float4(linearAlbedo, saturate(materialParams.y));
+    output.Normal = float4(normalW, clamp(materialParams.x, 0.045f, 1));
     return output;
 }
 
@@ -383,7 +388,9 @@ float3 ReconstructWorldPosition(float2 uv, float depth)
     return worldPos.xyz;
 }
 
-float3 ComputeDirectionalLight(float3 normal, float3 viewDir, float3 albedo, float3 worldPos)
+#include "pbr.hlsli"
+
+float3 ComputeDirectionalLight(float3 normal, float3 viewDir, float3 albedo, float roughness, float metallic)
 {
     float3 color = 0.0f;
 
@@ -394,18 +401,13 @@ float3 ComputeDirectionalLight(float3 normal, float3 viewDir, float3 albedo, flo
         float intensity = gDirectionalLights[i].directionIntensity.w;
         float3 lightColor = gDirectionalLights[i].color.xyz;
 
-        float ndl = saturate(dot(normal, lightDir));
-        float3 halfVec = normalize(lightDir + viewDir);
-        float spec = pow(saturate(dot(normal, halfVec)), 32.0f);
-
-        color += albedo * lightColor * ndl * intensity;
-        color += lightColor * spec * intensity * 0.35f;
+        color += PbrDirect(normal, viewDir, lightDir, albedo, roughness, metallic, lightColor * intensity);
     }
 
     return color;
 }
 
-float3 ComputeSinglePointLight(float3 normal, float3 viewDir, float3 albedo, float3 worldPos)
+float3 ComputeSinglePointLight(float3 normal, float3 viewDir, float3 albedo, float3 worldPos, float roughness, float metallic)
 {
     float3 lightVector = gPointLightPositionRange.xyz - worldPos;
     float distanceToLight = length(lightVector);
@@ -416,19 +418,16 @@ float3 ComputeSinglePointLight(float3 normal, float3 viewDir, float3 albedo, flo
 
     float attenuation = 1.0f - saturate(distanceToLight / range);
     attenuation *= attenuation;
-    float3 lightDir = normalize(lightVector);
-    float ndl = saturate(dot(normal, lightDir));
-    float3 halfVec = normalize(lightDir + viewDir);
-    float spec = pow(saturate(dot(normal, halfVec)), 32.0f);
+    float3 lightDir = lightVector / max(distanceToLight, 0.0001f);
 
     float3 lightColor = gPointLightColorIntensity.xyz;
     float intensity = gPointLightColorIntensity.w;
 
-    return albedo * lightColor * ndl * intensity * attenuation +
-        lightColor * spec * intensity * attenuation * 0.35f;
+    attenuation /= max(distanceToLight * distanceToLight, 0.01f);
+    return PbrDirect(normal, viewDir, lightDir, albedo, roughness, metallic, lightColor * intensity * attenuation);
 }
 
-float3 ComputeSpotLights(float3 normal, float3 viewDir, float3 albedo, float3 worldPos)
+float3 ComputeSpotLights(float3 normal, float3 viewDir, float3 albedo, float3 worldPos, float roughness, float metallic)
 {
     float3 color = 0.0f;
 
@@ -442,7 +441,7 @@ float3 ComputeSpotLights(float3 normal, float3 viewDir, float3 albedo, float3 wo
         if (distanceToLight > range)
             continue;
 
-        float3 lightDir = normalize(lightVector);
+        float3 lightDir = lightVector / max(distanceToLight, 0.0001f);
         float3 spotDir = normalize(-gSpotLights[i].directionAngle.xyz);
         float cone = saturate(dot(lightDir, spotDir));
         float cutoff = gSpotLights[i].directionAngle.w;
@@ -451,15 +450,12 @@ float3 ComputeSpotLights(float3 normal, float3 viewDir, float3 albedo, float3 wo
             continue;
 
         float attenuation = (1.0f - saturate(distanceToLight / range)) * smoothstep(cutoff, 1.0f, cone);
-        float ndl = saturate(dot(normal, lightDir));
-        float3 halfVec = normalize(lightDir + viewDir);
-        float spec = pow(saturate(dot(normal, halfVec)), 32.0f);
+        attenuation *= attenuation / max(distanceToLight * distanceToLight, 0.01f);
 
         float3 lightColor = gSpotLights[i].colorIntensity.xyz;
         float intensity = gSpotLights[i].colorIntensity.w;
 
-        color += albedo * lightColor * ndl * intensity * attenuation;
-        color += lightColor * spec * intensity * attenuation * 0.35f;
+        color += PbrDirect(normal, viewDir, lightDir, albedo, roughness, metallic, lightColor * intensity * attenuation);
     }
 
     return color;
@@ -471,7 +467,8 @@ float4 LightingPS(FullscreenPSInput pin) : SV_Target
 {
     float2 uv = pin.TexC;
     float4 albedoSample = gAlbedoBuffer.Sample(gSampler, uv);
-    float3 normal = normalize(gNormalBuffer.Sample(gSampler, uv).xyz);
+    float4 normalSample = gNormalBuffer.Sample(gSampler, uv);
+    float3 normal = normalize(normalSample.xyz);
     float depth = gDepthBuffer.Sample(gSampler, uv).r;
     if (depth >= 1.0f) return float4(0, 0, 0, 1);
 
@@ -479,9 +476,11 @@ float4 LightingPS(FullscreenPSInput pin) : SV_Target
     float3 viewDir = normalize(gCameraPosition.xyz - worldPos);
     float3 albedo = albedoSample.rgb;
 
-    float3 color = albedo * float3(0.18f, 0.19f, 0.20f);
-    color += ComputeDirectionalLight(normal, viewDir, albedo, worldPos) * DirectionalShadow(worldPos, normal);
-    color += ComputeSpotLights(normal, viewDir, albedo, worldPos);
+    float roughness = clamp(normalSample.a, 0.045f, 1);
+    float metallic = saturate(albedoSample.a);
+    float3 color = PbrIbl(normal, viewDir, albedo, roughness, metallic);
+    color += ComputeDirectionalLight(normal, viewDir, albedo, roughness, metallic) * DirectionalShadow(worldPos, normal);
+    color += ComputeSpotLights(normal, viewDir, albedo, worldPos, roughness, metallic);
 
     if (gShadowParams.w > 0.5)
     {
@@ -509,7 +508,8 @@ float4 PointLightVolumePS(PointLightVolumePSInput pin) : SV_Target
         discard;
 
     float4 albedoSample = gAlbedoBuffer.Sample(gSampler, uv);
-    float3 normal = normalize(gNormalBuffer.Sample(gSampler, uv).xyz);
+    float4 normalSample = gNormalBuffer.Sample(gSampler, uv);
+    float3 normal = normalize(normalSample.xyz);
     float depth = gDepthBuffer.Sample(gSampler, uv).r;
 
     if (depth >= 0.99999f)
@@ -520,7 +520,8 @@ float4 PointLightVolumePS(PointLightVolumePSInput pin) : SV_Target
     if (length(gPointLightPositionRange.xyz - worldPos) > gPointLightPositionRange.w)
         discard;
 
-    float3 color = ComputeSinglePointLight(normal, viewDir, albedoSample.rgb, worldPos);
+    float3 color = ComputeSinglePointLight(normal, viewDir, albedoSample.rgb, worldPos,
+        clamp(normalSample.a, 0.045f, 1), saturate(albedoSample.a));
     return float4(color, 1.0f);
 }
 

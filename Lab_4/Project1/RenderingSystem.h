@@ -85,6 +85,7 @@ struct SceneRenderContext
     DirectX::BoundingBox SceneBounds;
     bool CacheTessellation = true;
     PostProcessingSettings Post;
+    bool IblEnabled = true;
 };
 
 struct TessellationCacheStats
@@ -259,6 +260,7 @@ private:
         DirectX::XMFLOAT4 CascadeSplits;
         DirectX::XMFLOAT4 ShadowParams;
         DirectX::XMFLOAT4 ShadowConfig;
+        DirectX::XMFLOAT4 IblParams; // Enabled, intensity, maximum reflection mip, padding.
     };
 
     struct PointLightVolumeConstants
@@ -271,6 +273,8 @@ private:
     void BuildRootSignatures();
     void BuildPsos(DXGI_FORMAT backBufferFormat);
     void BuildDeferredDescriptorHeap();
+    void BuildIblResources();
+    ComPtr<ID3D12Resource> mIrradianceMap, mPrefilterMap, mBrdfLut;
     void BuildFrameConstants();
     void BuildShaders();
     void BuildPointLightVolumeMesh();

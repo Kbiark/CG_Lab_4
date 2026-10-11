@@ -1,5 +1,6 @@
 #include "../Lab_4/Project1/RenderingSystem.h"
 #include "../Lab_4/Project1/ThrowIfFailed.h"
+#include "../Lab_4/Project1/d3dUtil.h"
 #include <d3d12sdklayers.h>
 #include <iostream>
 #include <cstring>
@@ -13,6 +14,22 @@ struct ShadowTestAccess
 {
     static ID3D12Resource* Map(RenderingSystem& renderer) { return renderer.mShadowMap.Get(); }
     static ID3D12Resource* PostOutput(RenderingSystem& renderer) { return renderer.mPostOutput.Get(); }
+    static void CheckIblResources(RenderingSystem& renderer)
+    {
+        const auto diffuse = renderer.mIrradianceMap->GetDesc();
+        const auto reflection = renderer.mPrefilterMap->GetDesc();
+        const auto lut = renderer.mBrdfLut->GetDesc();
+        if (diffuse.DepthOrArraySize != 6 || diffuse.Format != DXGI_FORMAT_BC6H_UF16 ||
+            reflection.DepthOrArraySize != 6 || reflection.MipLevels != 12 ||
+            lut.DepthOrArraySize != 1 || lut.Format != DXGI_FORMAT_R32G32_FLOAT)
+            throw std::runtime_error("Missing precomputed IBL cubemaps/mips/BRDF LUT");
+    }
+    static void DisableDirectLights(RenderingSystem& renderer)
+    {
+        renderer.mDirectionalLights[0].Intensity = 0;
+        renderer.mPointLights.clear();
+        renderer.mSpotLights.clear();
+    }
     static std::vector<unsigned> VisibleIds(RenderingSystem& renderer)
     {
         auto ids = renderer.mCullingScene.VisibleIds;
@@ -98,6 +115,11 @@ try
     ThrowIfFailed(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)));
     ComPtr<ID3D12GraphicsCommandList> commands;
     ThrowIfFailed(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&commands)));
+    bool rejectedInvalidDds = false;
+    ComPtr<ID3D12Resource> invalidUpload;
+    try { d3dUtil::LoadIblDds(device.Get(), commands.Get(), L"../Project1/shaders.hlsl", invalidUpload); }
+    catch (const std::runtime_error&) { rejectedInvalidDds = true; }
+    Require(rejectedInvalidDds, "DDS loader accepts a file without a valid DDS header");
     ComPtr<ID3D12Fence> fence;
     ThrowIfFailed(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)));
     HANDLE event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
@@ -492,6 +514,43 @@ try
     const auto depthPost = render();
     Require(albedoPost != originalPost && normalsPost != albedoPost && depthPost != normalsPost,
         "Post compute shader G-buffer views are missing");
+    ShadowTestAccess::CheckIblResources(renderer);
+    scene.Post.BufferView = 0;
+    scene.Shadows.Enabled = false;
+    scene.Shadows.ShowCascades = false;
+    scene.IblEnabled = true;
+    const auto pbrWithIbl = render();
+    scene.IblEnabled = false;
+    Require(render() != pbrWithIbl, "IBL toggle does not affect PBR lighting");
+    ShadowTestAccess::DisableDirectLights(renderer);
+    const auto noLight = render();
+    for (size_t i = 0; i < noLight.size(); i += 4)
+        Require(noLight[i] == 0 && noLight[i+1] == 0 && noLight[i+2] == 0, "PBR has an artificial ambient term");
+    scene.IblEnabled = true;
+    const auto diffuseIbl = render();
+    Require(diffuseIbl != noLight, "Irradiance map does not illuminate the scene without direct lights");
+    materials[0].Metallic = 1;
+    materials[0].Roughness = 0.1f;
+    const auto polishedMetal = render();
+    Require(polishedMetal != diffuseIbl, "Metallic parameter has no effect");
+    materials[0].Roughness = 1;
+    const auto roughMetal = render();
+    UINT changedReflections = 0;
+    for (size_t i = 0; i < roughMetal.size(); i += 4)
+        if (std::abs(int(roughMetal[i]) - int(polishedMetal[i])) > 3) ++changedReflections;
+    Require(changedReflections > 100, "Roughness does not change prefiltered IBL reflections");
+    materials[0].Roughness = 4;
+    materials[0].Metallic = 4;
+    Require(render() == roughMetal, "Material upper bounds are not clamped");
+    materials[0].Roughness = 0.045f;
+    materials[0].Metallic = 0;
+    const auto smoothDielectric = render();
+    materials[0].Roughness = -1;
+    materials[0].Metallic = -1;
+    Require(render() == smoothDielectric, "Material lower bounds are not clamped");
+    scene.Post.BufferView = 3;
+    std::cout << "PASS: precomputed IBL resources, direct/IBL separation, metallic, roughness ("
+        << changedReflections << " reflection pixels), parameter bounds\n";
     // An empty scene has depth=1 everywhere: every quad pixel, not only its center, must be white.
     scene.Shadows.ShowGround = false;
     submeshes.clear();

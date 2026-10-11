@@ -120,6 +120,10 @@
     </None>
     <None Include="shaders.hlsl" />
     <None Include="post_processing.hlsli" />
+    <None Include="pbr.hlsli"><Filter>Shaders</Filter></None>
+    <None Include="Assets\IBL\IntegrationMap.dds" />
+    <None Include="Assets\IBL\IrradianceMap_BC6U.dds" />
+    <None Include="Assets\IBL\PreFilteredEnvMap_BC6U.dds" />
     <None Include="sponza.mtl" />
   </ItemGroup>
 </Project>
